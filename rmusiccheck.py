@@ -1,6 +1,6 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
-'''rMusicCheck 0.1
+'''rMusicCheck 0.2
 
 Author:      Rabit <home@rabits.org>
 License:     GPL v3
@@ -23,12 +23,16 @@ if os.geteuid() == 0:
 
 # Predefines
 SCHEME_FIELDS = {
-    'artist': { 'req': True,  're': r'[a-zA-Z0-9_- ]+' },
-    'album':  { 'req': True,  're': r'[a-zA-Z0-9_- ]+' },
-    'track':  { 'req': True,  're': r'\d+' },
-    'title':  { 'req': True,  're': r'[a-zA-Z0-9_- ]+' },
-    'year':   { 'req': True,  're': r'\d{4}' },
-    'genre':  { 'req': False, 're': r'[a-zA-Z0-9_- ]+' },
+    'required': {
+        'artist': ur'[\w0-9_\-\ ]+',
+        'album':  ur'[\w0-9_\-\ ]+',
+        'track':  ur'\d+',
+        'title':  ur'[\w0-9_\-\ ]+',
+        'year':   ur'\d{4}',
+    },
+    'optional': {
+        'genre':  ur'[a-zA-Z0-9_\-\ ]+',
+    },
 }
 
 def exampleini(option, opt, value, parser):
@@ -49,7 +53,7 @@ parser.add_option('-u', '--url-db', type='string', dest='url-db', metavar='URL',
 parser.add_option('-d', '--database', type='string', dest='database', metavar='DIR',
         default='${HOME}/.local/share/rmusiccheck', help='your local database directory ["%default"]')
 parser.add_option('-s', '--scheme', type='string', dest='scheme', metavar='PATH',
-        default='{genre}/{artist}/[{year}] {album}/{track} - {title}', help='scheme of your music folder (available: %s) %s' % (','.join(SCHEME_FIELDS), '["%default"]'))
+        default='{genre}/{artist}/[{year}] {album}/{track} - {title}', help='scheme of your music folder (available: %s) %s' % (','.join(SCHEME_FIELDS['required'].keys() + SCHEME_FIELDS['optional'].keys()), '["%default"]'))
 parser.add_option('-a', '--audio-ext', type='string', dest='audio-ext', metavar='EXT',
         default='mp3,flac', help='music file extensions, separated by comma ["%default"]')
 parser.add_option('-c', '--config-file', type='string', dest='config-file', metavar='FILE',
@@ -96,9 +100,9 @@ if options['other'] != None and not os.path.isdir(options['playlist']):
 
 options['audio-ext'] = options['audio-ext'].lower().split(',')
 
-for field, data in SCHEME_FIELDS.items():
-    if data['req'] and field not in options['scheme']:
-        parser.error('Unable to find required field "{%s}" in scheme' % (field, options['scheme']))
+for field in SCHEME_FIELDS['required']:
+    if field not in options['scheme']:
+        parser.error('Unable to find required field "{%s}" in your scheme "%s"' % (field, options['scheme']))
 
 # LOGGING
 if options['log-file'] != None:
@@ -136,6 +140,35 @@ else:
                 stderr.write('[%s %s]: %s\n' % (time.strftime('%H:%M:%S'), logtype, message))
 
 
+class Report:
+    """
+    Report class for collect number of problems
+    """
+    def __init__(self):
+        log('DEBUG', 'Init report')
+        self.data = {
+            'extensions':{},
+            'depth':[],
+            'fields':{},
+        }
+
+    def pushExtension(self, path, ext):
+        if ext not in self.data['extensions']:
+            self.data['extensions'][ext] = []
+        self.data['extensions'][ext].append(path)
+
+    def pushDepth(self, path):
+        self.data['depth'].append(path)
+
+    def pushFields(self, path, fields):
+        req = SCHEME_FIELDS['required'].keys()
+        self.data['fields'][path] = [r for r in req if r not in fields]
+
+    def show(self):
+        log('REPORT', 'Found next bad extensions: %s' % ', '.join(self.data['extensions']))
+        log('REPORT', 'Found bad music file depth:\n    %s' % '\n    '.join(self.data['depth']))
+        for path, fields in self.data['fields'].items():
+            log('REPORT', 'Unable to get required field(s) (%s) for path "%s": ' % (', '.join(fields), path))
 
 
 class RMusicCheck:
@@ -144,48 +177,98 @@ class RMusicCheck:
     '''
     def __init__(self):
         log('DEBUG', 'Init...')
+        self.report = Report()
         splitted_scheme = options['scheme'].split('/')
         self.scheme_fields = [[j[1:-1] for j in re.findall(r'{\w+}', i)] for i in splitted_scheme]
         self.scheme_re = []
+        self.required_fields = SCHEME_FIELDS['required'].keys()
         for part in splitted_scheme:
             part = re.escape(part)
-            for field, data in SCHEME_FIELDS.items():
+            for field, regexp in SCHEME_FIELDS['required'].items() + SCHEME_FIELDS['optional'].items():
                 f = '\\{%s\\}' % field
                 if f in part:
-                    part = part.replace(f, data['re'])
+                    part = part.replace(f, '(%s)' % regexp)
             self.scheme_re.append(part)
         self.db = {}
 
     def start(self):
         log('DEBUG', 'Process starting...')
         self.initTrees()
+        self.report.show()
 
     def initTrees(self):
         log('DEBUG', 'Populating trees...')
-        self.trees = [self.createTree(options['playlist'], len(options['playlist']))]
+        self.trees = [self.createTree(options['playlist'])]
         if options['other']:
-            self.trees.append(self.createTree(options['other'], len(options['other'])))
+            self.trees.append(self.createTree(options['other']))
 
     def pushDB(self, path):
-         splitted = path.split('/')
-         if len(splitted) != len(self.scheme_fields):
-             log('WARNING', 'Skip: Bad number of subfolders: %s' % path)
-             return False
-         return True
+        if not self.checkDepth(path):
+            return
+        data = self.parse(path)
+        if data:
+            data['year'] = int(data['year'])
+            album = '%d %s' % (data['year'], data['album'])
+            track = int(data.pop('track'))
+            title = data.pop('title')
+            if data['artist'] not in self.db:
+                self.db[data['artist']] = {}
+            if album not in self.db[data['artist']]:
+                self.db[data['artist']][album] = data
+                self.db[data['artist']][album]['tracks'] = {}
+                self.db[data['artist']][album]['paths'] = {}
+                self.db[data['artist']][album]['count'] = 0
+            self.db[data['artist']][album]['tracks'][track] = title
+            self.db[data['artist']][album]['paths'][track] = path
+            self.db[data['artist']][album]['count'] += 1
 
-    def createTree(self, path, basepathlen):
+    def createTree(self, basepath, path = ''):
         out = {}
-        for f in os.listdir(path):
-            fullpath = os.path.join(path, f)
-            if os.path.isdir(fullpath):
-                out[f] = self.createTree(fullpath, basepathlen)
+        listdir = os.listdir(os.path.join(basepath, path))
+        listdir.sort()
+        for f in listdir:
+            print path, f
+            filepath = unicode(os.path.join(path, f))
+            if os.path.isdir(os.path.join(basepath, filepath)):
+                out[f] = self.createTree(basepath, filepath)
             else:
-                if os.path.splitext(f)[1].lower()[1:] in options['audio-ext']:
-                    if not self.pushDB(fullpath[basepathlen+1:]):
-                        break
+                if self.checkExtension(filepath):
+                    self.pushDB(filepath)
                     out[f] = True
                 else:
                     out[f] = False
+        return out
+
+    def checkExtension(self, path):
+        ext = os.path.splitext(path)[1].lower()[1:]
+        if ext not in options['audio-ext']:
+            self.report.pushExtension(path, ext)
+            return False
+        return True
+
+    def checkDepth(self, path):
+        if len(path.split('/')) != len(self.scheme_fields):
+            self.report.pushDepth(path)
+            return False
+        return True
+
+    def checkFields(self, path, fields):
+        for req in self.required_fields:
+            if not req in fields:
+                self.report.pushFields(path, fields)
+                return False
+        return True
+
+    def parse(self, path):
+        out = {}
+        splitted = path.split('/')
+        for level, part in enumerate(splitted):
+            matched = re.match(self.scheme_re[level], part, re.UNICODE)
+            if matched:
+                for mlevel, match in enumerate(matched.groups()):
+                    out[self.scheme_fields[level][mlevel]] = match
+        if not self.checkFields(path, out.keys()):
+            return False
         return out
 
 # Request artist id: http://musicbrainz.org/ws/2/artist/?query=artist:Ария&fmt=json

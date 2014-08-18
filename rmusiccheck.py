@@ -1,6 +1,6 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
-'''rMusicCheck 0.2
+'''rMusicCheck 0.3
 
 Author:      Rabit <home@rabits.org>
 License:     GPL v3
@@ -12,7 +12,7 @@ Usage:
 '''
 
 from sys import stderr, stdout, exit as sysexit
-import os, time, urllib2, re
+import os, time, urllib2, re, readline
 
 from optparse import OptionParser
 import ConfigParser
@@ -24,10 +24,10 @@ if os.geteuid() == 0:
 # Predefines
 SCHEME_FIELDS = {
     'required': {
-        'artist': ur'[\w0-9_\-\ ]+',
-        'album':  ur'[\w0-9_\-\ ]+',
+        'artist': ur'[\w0-9_\-\ ,.!?&\']+',
+        'album':  ur'[\w0-9_\-\ ,.!?&\']+',
         'track':  ur'\d+',
-        'title':  ur'[\w0-9_\-\ ]+',
+        'title':  ur'[\w0-9_\-\ ,.!?&\']+',
         'year':   ur'\d{4}',
     },
     'optional': {
@@ -54,6 +54,8 @@ parser.add_option('-d', '--database', type='string', dest='database', metavar='D
         default='${HOME}/.local/share/rmusiccheck', help='your local database directory ["%default"]')
 parser.add_option('-s', '--scheme', type='string', dest='scheme', metavar='PATH',
         default='{genre}/{artist}/[{year}] {album}/{track} - {title}', help='scheme of your music folder (available: %s) %s' % (','.join(SCHEME_FIELDS['required'].keys() + SCHEME_FIELDS['optional'].keys()), '["%default"]'))
+parser.add_option('-m', '--manual-fix', action="store_true", dest='manual-fix',
+        default=False, help='scheme of your music folder (available: %s) %s' % (','.join(SCHEME_FIELDS['required'].keys() + SCHEME_FIELDS['optional'].keys()), '["%default"]'))
 parser.add_option('-a', '--audio-ext', type='string', dest='audio-ext', metavar='EXT',
         default='mp3,flac', help='music file extensions, separated by comma ["%default"]')
 parser.add_option('-c', '--config-file', type='string', dest='config-file', metavar='FILE',
@@ -149,6 +151,7 @@ class Report:
         self.data = {
             'extensions':{},
             'depth':[],
+            'empty':[],
             'fields':{},
         }
 
@@ -160,6 +163,9 @@ class Report:
     def pushDepth(self, path):
         self.data['depth'].append(path)
 
+    def pushEmpty(self, path):
+        self.data['empty'].append(path)
+
     def pushFields(self, path, fields):
         req = SCHEME_FIELDS['required'].keys()
         self.data['fields'][path] = [r for r in req if r not in fields]
@@ -167,8 +173,10 @@ class Report:
     def show(self):
         log('REPORT', 'Found next bad extensions: %s' % ', '.join(self.data['extensions']))
         log('REPORT', 'Found bad music file depth:\n    %s' % '\n    '.join(self.data['depth']))
+        log('REPORT', 'Found empty directories:\n    %s' % '\n    '.join(self.data['empty']))
+        log('REPORT', 'Unable to get required field(s) for path(s):')
         for path, fields in self.data['fields'].items():
-            log('REPORT', 'Unable to get required field(s) (%s) for path "%s": ' % (', '.join(fields), path))
+            log('REPORT', '    (%s)\t%s' % (', '.join(fields), path))
 
 
 class RMusicCheck:
@@ -198,8 +206,10 @@ class RMusicCheck:
 
     def initTrees(self):
         log('DEBUG', 'Populating trees...')
+        self.treepath = options['playlist']
         self.trees = [self.createTree(options['playlist'])]
         if options['other']:
+            self.treepath = options['other']
             self.trees.append(self.createTree(options['other']))
 
     def pushDB(self, path):
@@ -226,8 +236,9 @@ class RMusicCheck:
         out = {}
         listdir = os.listdir(os.path.join(basepath, path))
         listdir.sort()
+        if len(listdir) == 0:
+            self.report.pushEmpty(path)
         for f in listdir:
-            print path, f
             filepath = unicode(os.path.join(path, f))
             if os.path.isdir(os.path.join(basepath, filepath)):
                 out[f] = self.createTree(basepath, filepath)
@@ -256,19 +267,51 @@ class RMusicCheck:
         for req in self.required_fields:
             if not req in fields:
                 self.report.pushFields(path, fields)
-                return False
-        return True
+                if options['manual-fix']:
+                    path = self.changeMove(path, 'Please, change the path according to scheme "%s":' % options['scheme'])
+                return False, path
+        return True, path
+
+    def changeMove(self, path_from, msg = 'You need to change value'):
+        out = path_from
+        readline.set_startup_hook(lambda: readline.insert_text(path_from))
+
+        log('REQUEST', msg)
+        try:
+            out = raw_input('> ')
+        finally:
+            readline.set_startup_hook()
+
+        path_from = os.path.join(self.treepath, path_from)
+        path_to = os.path.join(self.treepath, out)
+
+        log('MOVE', 'Moving file "%s" to "%s"...' % (path_from, path_to))
+        try:
+            dirs = os.path.dirname(path_to)
+            if not os.path.isdir(dirs):
+                os.makedirs(dirs)
+            os.rename(path_from, path_to)
+            log('MOVE', '   done')
+        except OSError as e:
+            log('MOVE', '   failed: %s' % e.strerror)
+
+        return out
 
     def parse(self, path):
         out = {}
-        splitted = path.split('/')
-        for level, part in enumerate(splitted):
-            matched = re.match(self.scheme_re[level], part, re.UNICODE)
-            if matched:
-                for mlevel, match in enumerate(matched.groups()):
-                    out[self.scheme_fields[level][mlevel]] = match
-        if not self.checkFields(path, out.keys()):
-            return False
+        while True:
+            out.clear()
+            splitted = os.path.splitext(path)[0].split('/')
+            for level, part in enumerate(splitted):
+                matched = re.match(self.scheme_re[level], part, re.UNICODE)
+                if matched:
+                    for mlevel, match in enumerate(matched.groups()):
+                        out[self.scheme_fields[level][mlevel]] = match
+            result, path = self.checkFields(path, out.keys())
+            if not result and not options['manual-fix']:
+                return False
+            if result or not options['manual-fix']:
+                break
         return out
 
 # Request artist id: http://musicbrainz.org/ws/2/artist/?query=artist:Ария&fmt=json
